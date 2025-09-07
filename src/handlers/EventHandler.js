@@ -374,4 +374,298 @@ class EventHandler {
 
     async createUserEventsTable() {
         try {
-            await this.db.
+            await this.db.run(`
+                CREATE TABLE IF NOT EXISTS user_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL
+                )
+            `);
+        } catch (error) {
+            this.logger.error('Error creating user_events table:', error);
+        }
+    }
+
+    async createGuildEventsTable() {
+        try {
+            await this.db.run(`
+                CREATE TABLE IF NOT EXISTS guild_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL
+                )
+            `);
+        } catch (error) {
+            this.logger.error('Error creating guild_events table:', error);
+        }
+    }
+
+    async handleReactionAdd(reaction, user) {
+        try {
+            if (user.bot) return;
+
+            // Check if reaction is on a listing message
+            const listing = await this.db.get(`
+                SELECT * FROM listings WHERE message_id = ?
+            `, [reaction.message.id]);
+
+            if (listing && reaction.emoji.name === '⭐') {
+                // Add to wishlist
+                await this.addToWishlist(user.id, listing);
+            }
+
+        } catch (error) {
+            this.logger.error('Error handling reaction add:', error);
+        }
+    }
+
+    async addToWishlist(userId, listing) {
+        try {
+            await this.db.run(`
+                INSERT OR IGNORE INTO wishlists (user_id, item_name, max_price, keywords, added_at)
+                VALUES (?, ?, ?, ?, ?)
+            `, [userId, listing.item_name, listing.price * 1.2, listing.category, new Date().toISOString()]);
+
+            this.logger.info(`Added ${listing.item_name} to ${userId}'s wishlist`);
+
+        } catch (error) {
+            this.logger.error('Error adding to wishlist:', error);
+        }
+    }
+
+    async handleVoiceStateUpdate(oldState, newState) {
+        // Could be used for voice-based trading features in the future
+        // For now, just log if needed for analytics
+        try {
+            if (oldState.channelId !== newState.channelId) {
+                await this.logUserEvent(newState.id, 'voice_state_change', {
+                    oldChannelId: oldState.channelId,
+                    newChannelId: newState.channelId
+                });
+            }
+        } catch (error) {
+            this.logger.error('Error handling voice state update:', error);
+        }
+    }
+
+    async handleRoleUpdate(oldRole, newRole) {
+        try {
+            // Check if admin role was modified
+            if (oldRole.permissions.has('Administrator') !== newRole.permissions.has('Administrator')) {
+                this.logger.info(`Role permission change: ${newRole.name} in ${newRole.guild.name}`);
+                
+                await this.logGuildEvent(newRole.guild.id, 'role_permission_change', {
+                    roleId: newRole.id,
+                    roleName: newRole.name,
+                    adminBefore: oldRole.permissions.has('Administrator'),
+                    adminAfter: newRole.permissions.has('Administrator')
+                });
+            }
+        } catch (error) {
+            this.logger.error('Error handling role update:', error);
+        }
+    }
+
+    async handleGuildMemberUpdate(oldMember, newMember) {
+        try {
+            // Check if user got/lost admin permissions
+            const oldAdmin = oldMember.permissions.has('Administrator');
+            const newAdmin = newMember.permissions.has('Administrator');
+
+            if (oldAdmin !== newAdmin) {
+                this.logger.info(`Admin permission change: ${newMember.user.tag} in ${newMember.guild.name}`);
+                
+                await this.logUserEvent(newMember.user.id, 'admin_permission_change', {
+                    guildId: newMember.guild.id,
+                    adminBefore: oldAdmin,
+                    adminAfter: newAdmin
+                });
+            }
+        } catch (error) {
+            this.logger.error('Error handling guild member update:', error);
+        }
+    }
+
+    async getEventStatistics(guildId = null, days = 30) {
+        try {
+            const dateLimit = new Date();
+            dateLimit.setDate(dateLimit.getDate() - days);
+
+            let userEventsQuery = `
+                SELECT event_type, COUNT(*) as count 
+                FROM user_events 
+                WHERE created_at >= ?
+            `;
+            let guildEventsQuery = `
+                SELECT event_type, COUNT(*) as count 
+                FROM guild_events 
+                WHERE created_at >= ?
+            `;
+            let params = [dateLimit.toISOString()];
+
+            if (guildId) {
+                guildEventsQuery += ` AND guild_id = ?`;
+                params.push(guildId);
+            }
+
+            userEventsQuery += ` GROUP BY event_type ORDER BY count DESC`;
+            guildEventsQuery += ` GROUP BY event_type ORDER BY count DESC`;
+
+            const userEvents = await this.db.all(userEventsQuery, params.slice(0, 1));
+            const guildEvents = await this.db.all(guildEventsQuery, params);
+
+            return {
+                period: `${days} days`,
+                userEvents: userEvents.reduce((acc, event) => {
+                    acc[event.event_type] = event.count;
+                    return acc;
+                }, {}),
+                guildEvents: guildEvents.reduce((acc, event) => {
+                    acc[event.event_type] = event.count;
+                    return acc;
+                }, {}),
+                totalUserEvents: userEvents.reduce((sum, event) => sum + event.count, 0),
+                totalGuildEvents: guildEvents.reduce((sum, event) => sum + event.count, 0),
+                generatedAt: new Date().toISOString()
+            };
+
+        } catch (error) {
+            this.logger.error('Error generating event statistics:', error);
+            return null;
+        }
+    }
+
+    async cleanupOldEvents() {
+        try {
+            const thirtyDaysAgo = new Date();
+            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+            const userEventsDeleted = await this.db.run(`
+                DELETE FROM user_events WHERE created_at < ?
+            `, [thirtyDaysAgo.toISOString()]);
+
+            const guildEventsDeleted = await this.db.run(`
+                DELETE FROM guild_events WHERE created_at < ?
+            `, [thirtyDaysAgo.toISOString()]);
+
+            this.logger.info(`Cleaned up old events: ${userEventsDeleted.changes || 0} user events, ${guildEventsDeleted.changes || 0} guild events`);
+
+        } catch (error) {
+            this.logger.error('Error cleaning up old events:', error);
+        }
+    }
+
+    async handleBotMention(message) {
+        try {
+            if (message.mentions.has(this.client.user)) {
+                const embed = new EmbedBuilder()
+                    .setTitle('👋 Hey there!')
+                    .setDescription(`I'm the Enhanced Shop Bot! Here's how to get started:`)
+                    .addFields(
+                        { name: '🆘 Get Help', value: '`!help`', inline: true },
+                        { name: '🛒 Start Selling', value: '`!sell`', inline: true },
+                        { name: '🔍 Search Items', value: '`!search <query>`', inline: true }
+                    )
+                    .setColor(0x00AE86)
+                    .setThumbnail(this.client.user.displayAvatarURL())
+                    .setTimestamp();
+
+                await message.reply({ embeds: [embed] });
+            }
+        } catch (error) {
+            this.logger.error('Error handling bot mention:', error);
+        }
+    }
+
+    async handleInviteCreate(invite) {
+        try {
+            this.logger.info(`Invite created: ${invite.code} in ${invite.guild?.name}`);
+            
+            if (invite.guild) {
+                await this.logGuildEvent(invite.guild.id, 'invite_create', {
+                    inviteCode: invite.code,
+                    inviterId: invite.inviter?.id,
+                    channelId: invite.channel?.id,
+                    maxAge: invite.maxAge,
+                    maxUses: invite.maxUses
+                });
+            }
+        } catch (error) {
+            this.logger.error('Error handling invite create:', error);
+        }
+    }
+
+    async handleError(error) {
+        try {
+            this.logger.error('Discord client error:', error);
+            
+            // Log critical errors for analysis
+            await this.logGuildEvent('global', 'bot_error', {
+                errorMessage: error.message,
+                errorStack: error.stack?.substring(0, 500),
+                timestamp: new Date().toISOString()
+            });
+
+            // If error is related to permissions, log specific details
+            if (error.code === 50013) { // Missing Permissions
+                this.logger.error('Permission error - bot may need additional permissions');
+            }
+
+            if (error.code === 50001) { // Missing Access
+                this.logger.error('Access error - bot may have been removed from channel/guild');
+            }
+
+        } catch (err) {
+            this.logger.error('Error in error handler:', err);
+        }
+    }
+
+    // Method to register all event listeners
+    registerEventListeners() {
+        // Member events
+        this.client.on('guildMemberAdd', this.handleMemberJoin.bind(this));
+        this.client.on('guildMemberRemove', this.handleMemberLeave.bind(this));
+        this.client.on('guildMemberUpdate', this.handleGuildMemberUpdate.bind(this));
+
+        // Guild events
+        this.client.on('guildCreate', this.handleGuildJoin.bind(this));
+        this.client.on('guildDelete', this.handleGuildLeave.bind(this));
+
+        // Message events
+        this.client.on('messageDelete', this.handleMessageDelete.bind(this));
+        this.client.on('messageCreate', (message) => {
+            if (message.mentions.has(this.client.user)) {
+                this.handleBotMention(message);
+            }
+        });
+
+        // Channel events
+        this.client.on('channelDelete', this.handleChannelDelete.bind(this));
+
+        // Reaction events
+        this.client.on('messageReactionAdd', this.handleReactionAdd.bind(this));
+
+        // Voice events (for future features)
+        this.client.on('voiceStateUpdate', this.handleVoiceStateUpdate.bind(this));
+
+        // Role events
+        this.client.on('roleUpdate', this.handleRoleUpdate.bind(this));
+
+        // Invite events
+        this.client.on('inviteCreate', this.handleInviteCreate.bind(this));
+
+        // Error handling
+        this.client.on('error', this.handleError.bind(this));
+        this.client.on('warn', (warning) => {
+            this.logger.warn('Discord client warning:', warning);
+        });
+
+        this.logger.info('✅ All event listeners registered');
+    }
+}
+
+module.exports = EventHandler;
