@@ -1,12 +1,42 @@
 {
-  "$schema": "https://railway.app/railway.schema.json",
-  "build": {
-    "builder": "NIXPACKS"
+  "name": "discord-shop-bot-railway",
+  "version": "2.0.0",
+  "description": "Enterprise Discord marketplace bot with AI features - Railway deployment ready",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "deploy": "railway up",
+    "migrate": "node src/database/migrate.js"
   },
-  "deploy": {
-    "numReplicas": 1,
-    "sleepApplication": false,
-    "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 10
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.3.1",
+    "sqlite3": "^5.1.6",
+    "node-cron": "^3.0.3",
+    "axios": "^1.6.2",
+    "form-data": "^4.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "marketplace",
+    "shop",
+    "escrow",
+    "trading",
+    "railway",
+    "ai-powered"
+  ],
+  "author": "Discord Shop Bot",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/discord-shop-bot"
   }
 }
