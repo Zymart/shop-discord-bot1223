@@ -35,8 +35,8 @@ class DiscordShopBot {
     }
 
     setupEventListeners() {
-        // Bot ready event
-        this.client.once('ready', async () => {
+        // Bot ready event (using clientReady to avoid deprecation warning)
+        this.client.once('clientReady', async () => {
             this.logger.info(`🚀 ${this.client.user.tag} is online!`);
             this.logger.info(`📊 Serving ${this.client.guilds.cache.size} servers`);
             this.logger.info(`👥 Watching ${this.client.users.cache.size} users`);
