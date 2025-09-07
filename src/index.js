@@ -16,7 +16,7 @@ class DiscordShopBot {
                 GatewayIntentBits.GuildMessages,
                 GatewayIntentBits.MessageContent,
                 GatewayIntentBits.GuildMembers,
-                GatewayIntentBits.MessageReactions
+                GatewayIntentBits.GuildMessageReactions
             ]
         });
 
