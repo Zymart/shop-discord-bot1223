@@ -11,6 +11,10 @@ class InteractionHandler {
         this.aiService = new AIService(database);
         this.escrowService = new EscrowService(client, database, logger);
         this.securityService = new SecurityService(database, logger);
+        
+        // Owner ID - only this user has full admin access
+        this.ownerId = '730629579533844512';
+        this.adminIds = new Set([this.ownerId]); // Start with owner as admin
     }
 
     async handleInteraction(interaction) {
@@ -125,20 +129,20 @@ class InteractionHandler {
             .setMaxLength(500)
             .setPlaceholder('Detailed description of your item...');
 
-        const deliveryTime = new TextInputBuilder()
-            .setCustomId('delivery_time')
-            .setLabel('Estimated Delivery Time')
-            .setStyle(TextInputStyle.Short)
+        const imageUrls = new TextInputBuilder()
+            .setCustomId('image_urls')
+            .setLabel('Image URLs (Optional - One per line)')
+            .setStyle(TextInputStyle.Paragraph)
             .setRequired(false)
-            .setMaxLength(50)
-            .setPlaceholder('e.g., Instant, 1-24 hours, 2-3 days');
+            .setMaxLength(500)
+            .setPlaceholder('https://imgur.com/example1.png\nhttps://imgur.com/example2.png\n(Max 5 images)');
 
         modal.addComponents(
             new ActionRowBuilder().addComponents(itemName),
             new ActionRowBuilder().addComponents(price),
             new ActionRowBuilder().addComponents(quantity),
             new ActionRowBuilder().addComponents(description),
-            new ActionRowBuilder().addComponents(deliveryTime)
+            new ActionRowBuilder().addComponents(imageUrls)
         );
 
         await interaction.showModal(modal);
@@ -162,7 +166,19 @@ class InteractionHandler {
             const price = parseFloat(interaction.fields.getTextInputValue('price'));
             const quantity = parseInt(interaction.fields.getTextInputValue('quantity'));
             const description = interaction.fields.getTextInputValue('description');
-            const deliveryTime = interaction.fields.getTextInputValue('delivery_time') || 'Not specified';
+            const imageUrls = interaction.fields.getTextInputValue('image_urls') || '';
+
+            // Process image URLs
+            const images = [];
+            if (imageUrls.trim()) {
+                const urls = imageUrls.split('\n').filter(url => url.trim());
+                for (let url of urls.slice(0, 5)) { // Max 5 images
+                    url = url.trim();
+                    if (this.isValidImageUrl(url)) {
+                        images.push(url);
+                    }
+                }
+            }
 
             // Validation
             if (isNaN(price) || price <= 0) {
@@ -191,7 +207,7 @@ class InteractionHandler {
             // AI processing
             const aiAnalysis = await this.aiService.analyzeListing(itemName, description, price);
 
-            // Create listing - now goes to pending approval
+            // Create listing with images
             const listingId = `listing_${Date.now()}_${interaction.user.id}`;
             const listing = {
                 id: listingId,
@@ -204,8 +220,9 @@ class InteractionHandler {
                 quantity,
                 originalQuantity: quantity,
                 description,
-                deliveryTime,
-                status: 'pending_approval', // Require admin approval
+                deliveryTime: 'Will be specified during transaction',
+                images: images,
+                status: 'pending_approval',
                 createdAt: new Date().toISOString(),
                 views: 0,
                 priceAnalysis: aiAnalysis.priceAnalysis,
@@ -213,7 +230,7 @@ class InteractionHandler {
             };
 
             // Save to database
-            await this.db.createListing(listing);
+            await this.createListingWithImages(listing);
             this.logger.info(`Listing created for approval: ${listingId} by ${interaction.user.tag}`);
 
             // Update price history
@@ -234,10 +251,16 @@ class InteractionHandler {
                     { name: '📊 Stock', value: quantity.toString(), inline: true },
                     { name: '🏷️ AI Category', value: aiAnalysis.category, inline: true },
                     { name: '🔖 Auto Tags', value: aiAnalysis.tags.join(' '), inline: true },
-                    { name: '📈 Price Analysis', value: aiAnalysis.priceAnalysis, inline: true }
+                    { name: '📸 Images', value: images.length > 0 ? `${images.length} image(s) added` : 'No images', inline: true },
+                    { name: '📈 Price Analysis', value: aiAnalysis.priceAnalysis, inline: false }
                 )
                 .setColor(0xFFA500)
                 .setFooter({ text: 'Your listing is pending admin approval and will be live once approved!' });
+
+            // Add first image as thumbnail if available
+            if (images.length > 0) {
+                embed.setThumbnail(images[0]);
+            }
 
             await interaction.editReply({ embeds: [embed] });
 
@@ -246,6 +269,36 @@ class InteractionHandler {
             await interaction.editReply({ 
                 content: '❌ Error creating listing. Please try again.' 
             });
+        }
+    }
+
+    async createListingWithImages(listing) {
+        // Modified database create to handle images
+        const sql = `INSERT INTO listings (
+            id, seller_id, seller_tag, item_name, category, tags, price, 
+            quantity, original_quantity, description, delivery_time, 
+            status, created_at, price_analysis, auto_detected, images
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+        
+        return await this.db.run(sql, [
+            listing.id, listing.sellerId, listing.sellerTag, listing.itemName,
+            listing.category, JSON.stringify(listing.tags), listing.price,
+            listing.quantity, listing.originalQuantity, listing.description,
+            listing.deliveryTime, listing.status, listing.createdAt,
+            listing.priceAnalysis, JSON.stringify(listing.autoDetected),
+            JSON.stringify(listing.images || [])
+        ]);
+    }
+
+    isValidImageUrl(url) {
+        try {
+            new URL(url);
+            return /\.(jpg|jpeg|png|gif|webp)(\?.*)?$/i.test(url) || 
+                   url.includes('imgur.com') || 
+                   url.includes('discord.com/attachments') ||
+                   url.includes('cdn.discordapp.com');
+        } catch {
+            return false;
         }
     }
 
@@ -259,13 +312,19 @@ class InteractionHandler {
                     { name: '💰 Price', value: `$${listing.price}`, inline: true },
                     { name: '📊 Quantity', value: listing.quantity.toString(), inline: true },
                     { name: '👤 Seller', value: `<@${listing.sellerId}>`, inline: true },
-                    { name: '🤖 AI Tags', value: listing.tags.join(' '), inline: true },
+                    { name: '📸 Images', value: listing.images?.length > 0 ? `${listing.images.length} image(s)` : 'No images', inline: true },
+                    { name: '🤖 AI Tags', value: listing.tags.join(' '), inline: false },
                     { name: '📝 Description', value: listing.description.substring(0, 200) + (listing.description.length > 200 ? '...' : ''), inline: false },
                     { name: '📊 Price Analysis', value: listing.priceAnalysis, inline: false }
                 )
                 .setColor(0xFFA500)
                 .setTimestamp()
                 .setFooter({ text: `Listing ID: ${listing.id}` });
+
+            // Add first image as thumbnail
+            if (listing.images && listing.images.length > 0) {
+                embed.setThumbnail(listing.images[0]);
+            }
 
             const buttons = new ActionRowBuilder()
                 .addComponents(
@@ -301,9 +360,10 @@ class InteractionHandler {
     }
 
     async handleListingApproval(interaction, approved) {
-        if (!this.isAdmin(interaction.member)) {
+        // Check if user is owner or admin
+        if (!this.isOwnerOrAdmin(interaction.user.id)) {
             return await interaction.reply({ 
-                content: '❌ Admin access required!', 
+                content: '❌ Only the bot owner or designated admins can approve listings!', 
                 flags: 64 
             });
         }
@@ -311,11 +371,12 @@ class InteractionHandler {
         const listingId = interaction.customId.split('_')[2];
         
         try {
-            const listing = await this.db.getListing(listingId);
+            // Get listing from database with proper query
+            const listing = await this.db.get('SELECT * FROM listings WHERE id = ?', [listingId]);
 
             if (!listing) {
                 return await interaction.reply({ 
-                    content: '❌ Listing not found!', 
+                    content: `❌ Listing not found! ID: ${listingId}`, 
                     flags: 64 
                 });
             }
@@ -395,6 +456,16 @@ class InteractionHandler {
 
     async postListingToChannel(listing, guild) {
         try {
+            // Parse images if stored as JSON string
+            let images = [];
+            if (listing.images) {
+                try {
+                    images = typeof listing.images === 'string' ? JSON.parse(listing.images) : listing.images;
+                } catch (error) {
+                    this.logger.warn('Error parsing images:', error);
+                }
+            }
+
             // Find configured channel for category
             let targetChannel = null;
             
@@ -436,13 +507,18 @@ class InteractionHandler {
                     { name: '📊 Stock', value: listing.quantity.toString(), inline: true },
                     { name: '⭐ Seller Rating', value: `${sellerRating.average}/5 (${sellerRating.total} reviews)`, inline: true },
                     { name: '👤 Seller', value: `<@${listing.seller_id}>`, inline: true },
-                    { name: '🚚 Delivery Time', value: listing.delivery_time || 'Not specified', inline: true },
-                    { name: '🏷️ Tags', value: listing.tags.join(' '), inline: true },
+                    { name: '🚚 Delivery Time', value: 'Specified during transaction', inline: true },
+                    { name: '🏷️ Tags', value: (listing.tags ? JSON.parse(listing.tags) : []).join(' ') || 'None', inline: true },
                     { name: '📝 Description', value: listing.description, inline: false }
                 )
                 .setColor(0x00AE86)
                 .setTimestamp()
                 .setFooter({ text: `Listing ID: ${listing.id}` });
+
+            // Add first image as main image
+            if (images.length > 0) {
+                embed.setImage(images[0]);
+            }
 
             const buttons = new ActionRowBuilder()
                 .addComponents(
@@ -464,6 +540,21 @@ class InteractionHandler {
                 );
 
             const message = await targetChannel.send({ embeds: [embed], components: [buttons] });
+
+            // Send additional images if more than 1
+            if (images.length > 1) {
+                const additionalImages = images.slice(1, 4); // Max 3 additional images
+                for (const imageUrl of additionalImages) {
+                    try {
+                        const imageEmbed = new EmbedBuilder()
+                            .setImage(imageUrl)
+                            .setColor(0x00AE86);
+                        await targetChannel.send({ embeds: [imageEmbed] });
+                    } catch (error) {
+                        this.logger.warn('Error sending additional image:', error);
+                    }
+                }
+            }
             
             // Update listing with message info
             await this.db.updateListing(listing.id, {
@@ -478,6 +569,47 @@ class InteractionHandler {
         }
     }
 
+    // Owner/Admin check methods
+    isOwnerOrAdmin(userId) {
+        return userId === this.ownerId || this.adminIds.has(userId);
+    }
+
+    async addAdmin(userId) {
+        this.adminIds.add(userId);
+        // Save to database
+        try {
+            const currentAdmins = Array.from(this.adminIds);
+            await this.db.setGuildConfig('global', 'bot_admins', currentAdmins);
+        } catch (error) {
+            this.logger.error('Error saving admin list:', error);
+        }
+    }
+
+    async removeAdmin(userId) {
+        if (userId === this.ownerId) return false; // Can't remove owner
+        this.adminIds.delete(userId);
+        // Save to database
+        try {
+            const currentAdmins = Array.from(this.adminIds);
+            await this.db.setGuildConfig('global', 'bot_admins', currentAdmins);
+        } catch (error) {
+            this.logger.error('Error saving admin list:', error);
+        }
+        return true;
+    }
+
+    async loadAdmins() {
+        try {
+            const savedAdmins = await this.db.getGuildConfig('global', 'bot_admins');
+            if (savedAdmins && Array.isArray(savedAdmins)) {
+                savedAdmins.forEach(adminId => this.adminIds.add(adminId));
+            }
+        } catch (error) {
+            this.logger.error('Error loading admin list:', error);
+        }
+    }
+
+    // Rest of the methods remain the same...
     async handlePurchase(interaction) {
         const listingId = interaction.customId.split('_')[1];
         
@@ -668,9 +800,9 @@ class InteractionHandler {
     }
 
     async handleAdminButton(interaction) {
-        if (!this.isAdmin(interaction.member)) {
+        if (!this.isOwnerOrAdmin(interaction.user.id)) {
             return await interaction.reply({ 
-                content: '❌ Admin access required!', 
+                content: '❌ Only the bot owner or designated admins can use this feature!', 
                 flags: 64 
             });
         }
