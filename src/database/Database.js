@@ -508,3 +508,67 @@ class Database {
     // Search operations
     async searchListings(query, filters = {}) {
         let sql = `
+            SELECT l.*, ur.rating_avg, ur.rating_count 
+            FROM listings l
+            LEFT JOIN (
+                SELECT user_id, AVG(rating) as rating_avg, COUNT(*) as rating_count
+                FROM user_ratings GROUP BY user_id
+            ) ur ON l.seller_id = ur.user_id
+            WHERE l.status = 'active'
+        `;
+        let params = [];
+
+        // Text search
+        if (query) {
+            sql += ` AND (LOWER(l.item_name) LIKE ? OR LOWER(l.description) LIKE ? OR l.tags LIKE ?)`;
+            const searchTerm = `%${query.toLowerCase()}%`;
+            params.push(searchTerm, searchTerm, searchTerm);
+        }
+
+        // Filters
+        if (filters.category) {
+            sql += ` AND l.category = ?`;
+            params.push(filters.category);
+        }
+
+        if (filters.minPrice) {
+            sql += ` AND l.price >= ?`;
+            params.push(filters.minPrice);
+        }
+
+        if (filters.maxPrice) {
+            sql += ` AND l.price <= ?`;
+            params.push(filters.maxPrice);
+        }
+
+        if (filters.minRating) {
+            sql += ` AND ur.rating_avg >= ?`;
+            params.push(filters.minRating);
+        }
+
+        sql += ` ORDER BY l.views DESC, l.created_at DESC LIMIT 50`;
+
+        const results = await this.all(sql, params);
+        return results.map(listing => {
+            listing.tags = JSON.parse(listing.tags || '[]');
+            listing.images = JSON.parse(listing.images || '[]');
+            return listing;
+        });
+    }
+
+    async close() {
+        return new Promise((resolve) => {
+            if (this.db) {
+                this.db.close((err) => {
+                    if (err) console.error('Error closing database:', err);
+                    else console.log('📊 Database connection closed');
+                    resolve();
+                });
+            } else {
+                resolve();
+            }
+        });
+    }
+}
+
+module.exports = Database;
