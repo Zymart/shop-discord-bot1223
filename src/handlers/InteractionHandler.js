@@ -1,77 +1,16 @@
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, ChannelType } = require('discord.js');
+const AIService = require('../services/AIService');
+const EscrowService = require('../services/EscrowService');
+const SecurityService = require('../services/SecurityService');
 
 class InteractionHandler {
     constructor(client, database, logger) {
         this.client = client;
         this.db = database;
         this.logger = logger;
-        
-        // Initialize services with fallbacks if they don't exist
-        try {
-            const AIService = require('../services/AIService');
-            this.aiService = new AIService(database);
-        } catch (error) {
-            this.logger.warn('AIService not found, using fallback');
-            this.aiService = this.createFallbackAIService();
-        }
-        
-        try {
-            const EscrowService = require('../services/EscrowService');
-            this.escrowService = new EscrowService(client, database, logger);
-        } catch (error) {
-            this.logger.warn('EscrowService not found, using fallback');
-            this.escrowService = this.createFallbackEscrowService();
-        }
-        
-        try {
-            const SecurityService = require('../services/SecurityService');
-            this.securityService = new SecurityService(database, logger);
-        } catch (error) {
-            this.logger.warn('SecurityService not found, using fallback');
-            this.securityService = this.createFallbackSecurityService();
-        }
-    }
-
-    // Fallback services
-    createFallbackAIService() {
-        return {
-            analyzeListing: async (itemName, description, price) => ({
-                category: 'other',
-                tags: ['#general', '#trade'],
-                priceAnalysis: 'Standard pricing'
-            })
-        };
-    }
-
-    createFallbackEscrowService() {
-        return {
-            createTransactionThread: async (transaction, channel) => {
-                const thread = await channel.threads.create({
-                    name: `Transaction: ${transaction.itemName.substring(0, 50)}`,
-                    autoArchiveDuration: 1440,
-                    type: 0,
-                    reason: `Transaction between users`
-                });
-                return thread;
-            },
-            completeTransaction: async (transactionId, interaction) => {
-                await this.db.updateTransaction(transactionId, {
-                    status: 'completed',
-                    completed_at: new Date().toISOString()
-                });
-            }
-        };
-    }
-
-    createFallbackSecurityService() {
-        return {
-            validateListing: async (userId, itemName, price, description) => {
-                if (price < 0.01 || price > 10000) {
-                    return { passed: false, reason: 'Invalid price range' };
-                }
-                return { passed: true };
-            }
-        };
+        this.aiService = new AIService(database);
+        this.escrowService = new EscrowService(client, database, logger);
+        this.securityService = new SecurityService(database, logger);
     }
 
     async handleInteraction(interaction) {
@@ -88,7 +27,7 @@ class InteractionHandler {
             
             const errorMessage = { 
                 content: '❌ An error occurred while processing your request.', 
-                flags: 64 // InteractionResponseFlags.Ephemeral
+                flags: 64
             };
             
             try {
@@ -107,7 +46,6 @@ class InteractionHandler {
         const customId = interaction.customId;
         
         try {
-            // Route button interactions
             if (customId.startsWith('sell_form_')) {
                 await this.showSellModal(interaction);
             } else if (customId.startsWith('buy_')) {
@@ -240,12 +178,6 @@ class InteractionHandler {
             }
 
             // Security checks
-            this.logger.info(`Security validation for user ${interaction.user.id}: PASSED`, {
-                flags: [],
-                price,
-                itemName
-            });
-
             const securityCheck = await this.securityService.validateListing(
                 interaction.user.id, itemName, price, description
             );
@@ -259,7 +191,7 @@ class InteractionHandler {
             // AI processing
             const aiAnalysis = await this.aiService.analyzeListing(itemName, description, price);
 
-            // Create listing
+            // Create listing - now goes to pending approval
             const listingId = `listing_${Date.now()}_${interaction.user.id}`;
             const listing = {
                 id: listingId,
@@ -273,7 +205,7 @@ class InteractionHandler {
                 originalQuantity: quantity,
                 description,
                 deliveryTime,
-                status: 'active', // Skip approval for now to test
+                status: 'pending_approval', // Require admin approval
                 createdAt: new Date().toISOString(),
                 views: 0,
                 priceAnalysis: aiAnalysis.priceAnalysis,
@@ -282,7 +214,7 @@ class InteractionHandler {
 
             // Save to database
             await this.db.createListing(listing);
-            this.logger.info(`Listing created: ${listingId} by ${interaction.user.tag}`);
+            this.logger.info(`Listing created for approval: ${listingId} by ${interaction.user.tag}`);
 
             // Update price history
             try {
@@ -291,21 +223,21 @@ class InteractionHandler {
                 this.logger.warn('Failed to add price history:', error);
             }
 
-            // Post listing to channel immediately
-            await this.postListingToChannel(listing, interaction.guild);
+            // Send for admin approval
+            await this.sendForApproval(listing, interaction.guild);
 
             const embed = new EmbedBuilder()
-                .setTitle('✅ Listing Created Successfully!')
+                .setTitle('✅ Listing Submitted for Approval!')
                 .addFields(
                     { name: '📦 Item', value: itemName, inline: true },
                     { name: '💰 Price', value: `$${price}`, inline: true },
                     { name: '📊 Stock', value: quantity.toString(), inline: true },
-                    { name: '🏷️ Category', value: aiAnalysis.category, inline: true },
-                    { name: '🔖 Tags', value: aiAnalysis.tags.join(' '), inline: true },
+                    { name: '🏷️ AI Category', value: aiAnalysis.category, inline: true },
+                    { name: '🔖 Auto Tags', value: aiAnalysis.tags.join(' '), inline: true },
                     { name: '📈 Price Analysis', value: aiAnalysis.priceAnalysis, inline: true }
                 )
-                .setColor(0x00FF00)
-                .setFooter({ text: 'Your listing is now live!' });
+                .setColor(0xFFA500)
+                .setFooter({ text: 'Your listing is pending admin approval and will be live once approved!' });
 
             await interaction.editReply({ embeds: [embed] });
 
@@ -317,12 +249,155 @@ class InteractionHandler {
         }
     }
 
+    async sendForApproval(listing, guild) {
+        try {
+            const embed = new EmbedBuilder()
+                .setTitle('📋 New Listing - Requires Approval')
+                .addFields(
+                    { name: '📦 Item', value: listing.itemName, inline: true },
+                    { name: '🏷️ AI Category', value: listing.category, inline: true },
+                    { name: '💰 Price', value: `$${listing.price}`, inline: true },
+                    { name: '📊 Quantity', value: listing.quantity.toString(), inline: true },
+                    { name: '👤 Seller', value: `<@${listing.sellerId}>`, inline: true },
+                    { name: '🤖 AI Tags', value: listing.tags.join(' '), inline: true },
+                    { name: '📝 Description', value: listing.description.substring(0, 200) + (listing.description.length > 200 ? '...' : ''), inline: false },
+                    { name: '📊 Price Analysis', value: listing.priceAnalysis, inline: false }
+                )
+                .setColor(0xFFA500)
+                .setTimestamp()
+                .setFooter({ text: `Listing ID: ${listing.id}` });
+
+            const buttons = new ActionRowBuilder()
+                .addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(`admin_approve_${listing.id}`)
+                        .setLabel('Approve')
+                        .setStyle(ButtonStyle.Success)
+                        .setEmoji('✅'),
+                    new ButtonBuilder()
+                        .setCustomId(`admin_reject_${listing.id}`)
+                        .setLabel('Reject')
+                        .setStyle(ButtonStyle.Danger)
+                        .setEmoji('❌')
+                );
+
+            // Find admin channel
+            const adminChannels = guild.channels.cache.filter(channel => 
+                (channel.name.includes('admin') || channel.name.includes('mod') || channel.name.includes('approval')) &&
+                channel.permissionsFor(this.client.user).has(['SendMessages', 'ViewChannel'])
+            );
+
+            if (adminChannels.size > 0) {
+                const adminChannel = adminChannels.first();
+                await adminChannel.send({ embeds: [embed], components: [buttons] });
+                this.logger.info(`Approval request sent to ${adminChannel.name} for listing ${listing.id}`);
+            } else {
+                this.logger.warn(`No suitable admin channel found for approval in guild ${guild.name}`);
+            }
+
+        } catch (error) {
+            this.logger.error('Error sending for approval:', error);
+        }
+    }
+
+    async handleListingApproval(interaction, approved) {
+        if (!this.isAdmin(interaction.member)) {
+            return await interaction.reply({ 
+                content: '❌ Admin access required!', 
+                flags: 64 
+            });
+        }
+
+        const listingId = interaction.customId.split('_')[2];
+        
+        try {
+            const listing = await this.db.getListing(listingId);
+
+            if (!listing) {
+                return await interaction.reply({ 
+                    content: '❌ Listing not found!', 
+                    flags: 64 
+                });
+            }
+
+            if (listing.status !== 'pending_approval') {
+                return await interaction.reply({ 
+                    content: '❌ This listing has already been processed!', 
+                    flags: 64 
+                });
+            }
+
+            if (approved) {
+                // Approve listing
+                await this.db.updateListing(listingId, { status: 'active' });
+                
+                // Post to appropriate channel
+                await this.postListingToChannel(listing, interaction.guild);
+                
+                // Notify seller
+                try {
+                    const seller = await this.client.users.fetch(listing.seller_id);
+                    const approvalEmbed = new EmbedBuilder()
+                        .setTitle('✅ Listing Approved!')
+                        .setDescription(`Your listing **${listing.item_name}** has been approved and is now live!`)
+                        .addFields({ name: 'What\'s Next?', value: 'Your item is now visible to buyers. You\'ll be notified of any purchases.' })
+                        .setColor(0x00FF00)
+                        .setTimestamp();
+                    
+                    await seller.send({ embeds: [approvalEmbed] });
+                } catch (error) {
+                    this.logger.warn('Could not notify seller of approval');
+                }
+
+                await interaction.update({ 
+                    content: `✅ **Approved by ${interaction.user.tag}**\nListing "${listing.item_name}" is now live!`, 
+                    embeds: [], 
+                    components: [] 
+                });
+
+            } else {
+                // Reject listing
+                await this.db.updateListing(listingId, { status: 'rejected' });
+                
+                // Notify seller
+                try {
+                    const seller = await this.client.users.fetch(listing.seller_id);
+                    const rejectionEmbed = new EmbedBuilder()
+                        .setTitle('❌ Listing Rejected')
+                        .setDescription(`Your listing **${listing.item_name}** has been rejected by moderation.`)
+                        .addFields({ 
+                            name: 'Next Steps', 
+                            value: 'You can contact an administrator for more details or create a new listing with different content.' 
+                        })
+                        .setColor(0xFF0000)
+                        .setTimestamp();
+                    
+                    await seller.send({ embeds: [rejectionEmbed] });
+                } catch (error) {
+                    this.logger.warn('Could not notify seller of rejection');
+                }
+
+                await interaction.update({ 
+                    content: `❌ **Rejected by ${interaction.user.tag}**\nListing "${listing.item_name}" has been rejected and seller notified.`, 
+                    embeds: [], 
+                    components: [] 
+                });
+            }
+
+        } catch (error) {
+            this.logger.error('Listing approval error:', error);
+            await interaction.reply({ 
+                content: '❌ Error processing approval. Please try again.', 
+                flags: 64 
+            });
+        }
+    }
+
     async postListingToChannel(listing, guild) {
         try {
-            // Find a suitable channel to post in
+            // Find configured channel for category
             let targetChannel = null;
             
-            // First, try to get configured channel for category
             try {
                 const channelId = await this.db.getGuildConfig(guild.id, `category_${listing.category}_channel`);
                 if (channelId) {
@@ -332,15 +407,17 @@ class InteractionHandler {
                 this.logger.warn('Error getting guild config:', error);
             }
 
-            // If no configured channel, find a suitable one
+            // If no configured channel, find suitable one
             if (!targetChannel) {
                 targetChannel = guild.channels.cache.find(channel => 
-                    channel.name.includes('shop') || 
-                    channel.name.includes('market') || 
-                    channel.name.includes('trade') ||
-                    channel.name.includes(listing.category)
+                    (channel.name.includes('shop') || 
+                     channel.name.includes('market') || 
+                     channel.name.includes('trade') ||
+                     channel.name.includes(listing.category)) &&
+                    channel.permissionsFor(this.client.user).has(['SendMessages', 'ViewChannel'])
                 ) || guild.channels.cache.find(channel => 
-                    channel.type === 0 && channel.permissionsFor(this.client.user).has('SendMessages')
+                    channel.type === 0 && 
+                    channel.permissionsFor(this.client.user).has(['SendMessages', 'ViewChannel'])
                 );
             }
 
@@ -350,16 +427,16 @@ class InteractionHandler {
             }
 
             // Get seller rating
-            const sellerRating = await this.getUserRating(listing.sellerId);
+            const sellerRating = await this.getUserRating(listing.seller_id);
             
             const embed = new EmbedBuilder()
-                .setTitle(`${this.getCategoryEmoji(listing.category)} ${listing.itemName}`)
+                .setTitle(`${this.getCategoryEmoji(listing.category)} ${listing.item_name}`)
                 .addFields(
                     { name: '💰 Price', value: `$${listing.price}`, inline: true },
                     { name: '📊 Stock', value: listing.quantity.toString(), inline: true },
                     { name: '⭐ Seller Rating', value: `${sellerRating.average}/5 (${sellerRating.total} reviews)`, inline: true },
-                    { name: '👤 Seller', value: `<@${listing.sellerId}>`, inline: true },
-                    { name: '🚚 Delivery Time', value: listing.deliveryTime, inline: true },
+                    { name: '👤 Seller', value: `<@${listing.seller_id}>`, inline: true },
+                    { name: '🚚 Delivery Time', value: listing.delivery_time || 'Not specified', inline: true },
                     { name: '🏷️ Tags', value: listing.tags.join(' '), inline: true },
                     { name: '📝 Description', value: listing.description, inline: false }
                 )
@@ -394,7 +471,7 @@ class InteractionHandler {
                 message_id: message.id
             });
 
-            this.logger.info(`Listing posted to ${targetChannel.name}: ${listing.itemName}`);
+            this.logger.info(`Listing posted to ${targetChannel.name}: ${listing.item_name}`);
 
         } catch (error) {
             this.logger.error('Error posting listing to channel:', error);
@@ -477,7 +554,7 @@ class InteractionHandler {
             }
 
             await interaction.editReply({ 
-                content: '✅ Purchase initiated! ' + (thread ? `Check the transaction thread: <#${thread.id}>` : 'Transaction created successfully.')
+                content: '✅ Purchase initiated! ' + (thread ? `Check your secure transaction thread: <#${thread.id}>` : 'Transaction created successfully.')
             });
 
         } catch (error) {
@@ -497,12 +574,12 @@ class InteractionHandler {
             `, [userId]);
             
             return {
-                average: result?.average ? parseFloat(result.average).toFixed(1) : '0',
+                average: result?.average ? parseFloat(result.average).toFixed(1) : '0.0',
                 total: result?.total || 0
             };
         } catch (error) {
             this.logger.error('Error getting user rating:', error);
-            return { average: '0', total: 0 };
+            return { average: '0.0', total: 0 };
         }
     }
 
@@ -526,7 +603,7 @@ class InteractionHandler {
                );
     }
 
-    // Placeholder methods for other handlers
+    // Placeholder methods for features to be implemented
     async handleSelectMenu(interaction) {
         await interaction.reply({ 
             content: '❌ Select menu interactions not implemented yet.', 
@@ -534,65 +611,58 @@ class InteractionHandler {
         });
     }
 
-    async handleListingApproval(interaction, approved) {
-        await interaction.reply({ 
-            content: '❌ Listing approval system not fully implemented.', 
-            flags: 64 
-        });
-    }
-
     async handleDeliveryConfirmation(interaction) {
         await interaction.reply({ 
-            content: '❌ Delivery confirmation not fully implemented.', 
+            content: '✅ Delivery confirmation system coming soon!', 
             flags: 64 
         });
     }
 
     async handleDispute(interaction) {
         await interaction.reply({ 
-            content: '❌ Dispute system not fully implemented.', 
+            content: '⚠️ Dispute system coming soon! Contact an admin for now.', 
             flags: 64 
         });
     }
 
     async handleRating(interaction) {
         await interaction.reply({ 
-            content: '❌ Rating system not fully implemented.', 
+            content: '⭐ Rating system coming soon!', 
             flags: 64 
         });
     }
 
     async showProofModal(interaction) {
         await interaction.reply({ 
-            content: '❌ Proof submission not fully implemented.', 
+            content: '📸 Proof submission system coming soon!', 
             flags: 64 
         });
     }
 
     async handleFollowListing(interaction) {
         await interaction.reply({ 
-            content: '❌ Follow system not fully implemented.', 
+            content: '📥 Follow system coming soon!', 
             flags: 64 
         });
     }
 
     async showReportModal(interaction) {
         await interaction.reply({ 
-            content: '❌ Report system not fully implemented.', 
+            content: '🚨 Report system coming soon! Contact an admin for now.', 
             flags: 64 
         });
     }
 
     async handleProofSubmission(interaction) {
         await interaction.reply({ 
-            content: '❌ Proof submission not fully implemented.', 
+            content: '📸 Proof submission not fully implemented.', 
             flags: 64 
         });
     }
 
     async handleReportSubmission(interaction) {
         await interaction.reply({ 
-            content: '❌ Report submission not fully implemented.', 
+            content: '🚨 Report submission not fully implemented.', 
             flags: 64 
         });
     }
@@ -605,10 +675,40 @@ class InteractionHandler {
             });
         }
 
-        await interaction.reply({ 
-            content: '❌ Admin buttons not fully implemented.', 
-            flags: 64 
-        });
+        const customId = interaction.customId;
+
+        if (customId === 'admin_pending_listings') {
+            const pendingListings = await this.db.all(
+                'SELECT * FROM listings WHERE status = "pending_approval" ORDER BY created_at ASC LIMIT 5'
+            );
+
+            if (pendingListings.length === 0) {
+                return await interaction.reply({ 
+                    content: '✅ No pending listings!', 
+                    flags: 64 
+                });
+            }
+
+            const embed = new EmbedBuilder()
+                .setTitle('⏳ Pending Listings')
+                .setColor(0xFFA500)
+                .setDescription(`${pendingListings.length} listings awaiting approval`);
+
+            pendingListings.forEach((listing, index) => {
+                embed.addFields({
+                    name: `${index + 1}. ${listing.item_name}`,
+                    value: `**Seller:** <@${listing.seller_id}>\n**Price:** ${listing.price}\n**Created:** ${new Date(listing.created_at).toLocaleDateString()}\n**ID:** \`${listing.id}\``,
+                    inline: false
+                });
+            });
+
+            await interaction.reply({ embeds: [embed], flags: 64 });
+        } else {
+            await interaction.reply({ 
+                content: '❌ Admin button not fully implemented.', 
+                flags: 64 
+            });
+        }
     }
 }
 
