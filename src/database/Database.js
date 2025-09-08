@@ -29,7 +29,7 @@ class Database {
 
     async createTables() {
         const tables = [
-            // Listings table
+            // Listings table - Updated with images column
             `CREATE TABLE IF NOT EXISTS listings (
                 id TEXT PRIMARY KEY,
                 seller_id TEXT NOT NULL,
@@ -49,7 +49,8 @@ class Database {
                 channel_id TEXT,
                 message_id TEXT,
                 price_analysis TEXT,
-                auto_detected TEXT
+                auto_detected TEXT,
+                images TEXT
             )`,
 
             // Transactions table
@@ -174,6 +175,35 @@ class Database {
                 config_key TEXT NOT NULL,
                 config_value TEXT,
                 PRIMARY KEY (guild_id, config_key)
+            )`,
+
+            // User flags table for security
+            `CREATE TABLE IF NOT EXISTS user_flags (
+                user_id TEXT PRIMARY KEY,
+                risk_score INTEGER NOT NULL,
+                patterns TEXT,
+                flagged_at TEXT NOT NULL,
+                status TEXT DEFAULT 'flagged',
+                reviewed_by TEXT,
+                reviewed_at TEXT
+            )`,
+
+            // User events table
+            `CREATE TABLE IF NOT EXISTS user_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                metadata TEXT,
+                created_at TEXT NOT NULL
+            )`,
+
+            // Guild events table
+            `CREATE TABLE IF NOT EXISTS guild_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                metadata TEXT,
+                created_at TEXT NOT NULL
             )`
         ];
 
@@ -181,7 +211,25 @@ class Database {
             await this.run(table);
         }
 
+        // Check if images column exists, add if not
+        await this.addImagesColumnIfNotExists();
+
         console.log('✅ Database tables created/verified');
+    }
+
+    async addImagesColumnIfNotExists() {
+        try {
+            // Check if images column exists
+            const tableInfo = await this.all(`PRAGMA table_info(listings)`);
+            const hasImagesColumn = tableInfo.some(column => column.name === 'images');
+
+            if (!hasImagesColumn) {
+                await this.run(`ALTER TABLE listings ADD COLUMN images TEXT`);
+                console.log('✅ Added images column to listings table');
+            }
+        } catch (error) {
+            console.log('Images column already exists or error adding:', error.message);
+        }
     }
 
     // Helper methods for database operations
@@ -217,15 +265,16 @@ class Database {
         const sql = `INSERT INTO listings (
             id, seller_id, seller_tag, item_name, category, tags, price, 
             quantity, original_quantity, description, delivery_time, 
-            status, created_at, price_analysis, auto_detected
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+            status, created_at, price_analysis, auto_detected, images
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
         
         return await this.run(sql, [
             listing.id, listing.sellerId, listing.sellerTag, listing.itemName,
             listing.category, JSON.stringify(listing.tags), listing.price,
             listing.quantity, listing.originalQuantity, listing.description,
             listing.deliveryTime, listing.status, listing.createdAt,
-            listing.priceAnalysis, JSON.stringify(listing.autoDetected)
+            listing.priceAnalysis, JSON.stringify(listing.autoDetected),
+            JSON.stringify(listing.images || [])
         ]);
     }
 
@@ -234,6 +283,7 @@ class Database {
         if (listing) {
             listing.tags = JSON.parse(listing.tags || '[]');
             listing.autoDetected = JSON.parse(listing.auto_detected || '{}');
+            listing.images = JSON.parse(listing.images || '[]');
         }
         return listing;
     }
@@ -253,6 +303,7 @@ class Database {
         return listings.map(listing => {
             listing.tags = JSON.parse(listing.tags || '[]');
             listing.autoDetected = JSON.parse(listing.auto_detected || '{}');
+            listing.images = JSON.parse(listing.images || '[]');
             return listing;
         });
     }
@@ -457,66 +508,3 @@ class Database {
     // Search operations
     async searchListings(query, filters = {}) {
         let sql = `
-            SELECT l.*, ur.rating_avg, ur.rating_count 
-            FROM listings l
-            LEFT JOIN (
-                SELECT user_id, AVG(rating) as rating_avg, COUNT(*) as rating_count
-                FROM user_ratings GROUP BY user_id
-            ) ur ON l.seller_id = ur.user_id
-            WHERE l.status = 'active'
-        `;
-        let params = [];
-
-        // Text search
-        if (query) {
-            sql += ` AND (LOWER(l.item_name) LIKE ? OR LOWER(l.description) LIKE ? OR l.tags LIKE ?)`;
-            const searchTerm = `%${query.toLowerCase()}%`;
-            params.push(searchTerm, searchTerm, searchTerm);
-        }
-
-        // Filters
-        if (filters.category) {
-            sql += ` AND l.category = ?`;
-            params.push(filters.category);
-        }
-
-        if (filters.minPrice) {
-            sql += ` AND l.price >= ?`;
-            params.push(filters.minPrice);
-        }
-
-        if (filters.maxPrice) {
-            sql += ` AND l.price <= ?`;
-            params.push(filters.maxPrice);
-        }
-
-        if (filters.minRating) {
-            sql += ` AND ur.rating_avg >= ?`;
-            params.push(filters.minRating);
-        }
-
-        sql += ` ORDER BY l.views DESC, l.created_at DESC LIMIT 50`;
-
-        const results = await this.all(sql, params);
-        return results.map(listing => {
-            listing.tags = JSON.parse(listing.tags || '[]');
-            return listing;
-        });
-    }
-
-    async close() {
-        return new Promise((resolve) => {
-            if (this.db) {
-                this.db.close((err) => {
-                    if (err) console.error('Error closing database:', err);
-                    else console.log('📊 Database connection closed');
-                    resolve();
-                });
-            } else {
-                resolve();
-            }
-        });
-    }
-}
-
-module.exports = Database;
